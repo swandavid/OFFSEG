@@ -1,179 +1,263 @@
 # -*- coding: utf-8 -*-
 """
-Created on Wed Feb 10 15:07:05 2021
-
-@author: KASI VISWANATH && KARTIKEYA SINGH
+Pipeline for semantic segmentation and traversability classification.
 """
+import os
 import cv2
-import sys
 import numpy as np
 import tensorflow as tf
 import pandas as pd
-#from libKMCUDA import kmeans_cuda
-from PIL import Image,ImageOps
-import time
-import logging
 import torch
-sys.path.insert(0, '.')
-import argparse
-torch.set_grad_enabled(False)
-import os
-from sklearn.cluster import KMeans
 from fast_pytorch_kmeans import KMeans
-
 import lib.transform_cv2 as T
 from lib.models import model_factory
 from configs import cfg_factory
+import warnings
+import time
+from concurrent.futures import ThreadPoolExecutor
+import glob
+
+# Force TensorFlow to use CPU only (disable Metal/MPS)
+os.environ['CUDA_VISIBLE_DEVICES'] = '-1'
+tf.config.set_visible_devices([], 'GPU')
+tf.config.set_visible_devices([], 'TPU')
+
+# Suppress specific warnings
+warnings.filterwarnings('ignore', category=UserWarning, module='torchvision')
+warnings.filterwarnings('ignore', category=UserWarning, module='keras')
+warnings.filterwarnings('ignore', category=FutureWarning)
+warnings.filterwarnings('ignore', message='.*Failed to load image Python extension.*')
+warnings.filterwarnings('ignore', message='.*No training configuration found.*')
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
 
 np.random.seed(123)
-pal= np.random.randint(0, 256, (256, 3), dtype=np.uint8)
+pal = np.random.randint(0, 256, (256, 3), dtype=np.uint8)
 
-#torch_kmeans = KMeans(n_clusters=4, mode='euclidean', verbose=1) # 4 classes
-#image path
-img_path='/path/to/Directory'
-#result path
-final_path='/path/to/Directory'
-#Path to Model save path.
-dataset='/path/to/Directory/model_final.pth'
+class CompatibleDepthwiseConv2D(tf.keras.layers.DepthwiseConv2D):
+    """Custom DepthwiseConv2D to ignore 'groups' param for legacy models."""
+    def __init__(self, *args, **kwargs):
+        kwargs.pop('groups', None)
+        super().__init__(*args, **kwargs)
 
-#Function for 4 calss image segmentation
-def img_seg(im,net):
-    im = to_tensor(dict(im=im, lb=None))['im'].unsqueeze(0).cuda()
+def img_seg(im, net, to_tensor, pal):
+    """Run segmentation model and return colorized prediction and mask."""
+    if torch.cuda.is_available():
+        device = torch.device('cuda')
+    elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
+        device = torch.device('mps')
+    else:
+        device = torch.device('cpu')
+    im = to_tensor(dict(im=im, lb=None))['im'].unsqueeze(0).to(device)
     out = net(im)[0].argmax(dim=1).squeeze().detach().cpu().numpy()
-    pred=pal[out]
-    out=cv2.cvtColor(out.astype('uint8'),cv2.COLOR_GRAY2BGR)
-    return pred , out
+    pred = pal[out]
+    out = cv2.cvtColor(out.astype('uint8'), cv2.COLOR_GRAY2BGR)
+    return pred, out
 
-#Function for Kmeans clustering.     
-def palette_lst(masked_img,n_classes=4):
-    height=masked_img.shape[0]
-    width=masked_img.shape[1]
-    h,w=int(height),int(width)
-    masked_img=cv2.resize(masked_img,(w,h))
-    data = pd.DataFrame(masked_img.reshape(-1, 3),columns=['R', 'G', 'B'],dtype=np.float32)
+def palette_lst(masked_img, n_classes=4):
+    """Cluster image colors using KMeans and return list of masked images."""
+    h, w = masked_img.shape[:2]
+    print(f"Processing image of size {h}x{w}")
     
-    ## Uncomment below code for GPU based Kmeans clustering.
-    #palette, data['Cluster']= kmeans_cuda(data, n_classes, verbosity=1, seed=1)
-
-    ## Uncomment below code for CPU based Kmeans clustering.
-     
-#     outp=KMeans(n_clusters=4,random_state=0).fit(data)
-#     print(outp)
-#     palette=outp.cluster_centers_
-#     data['Cluster']=outp.labels_
-
-    ## Uncomment below code for Pytorch based Kmeans clustering.
-    torch_kmeans = KMeans(n_clusters=n_classes, mode='euclidean', verbose=1)
-    input = torch.tensor(data)
+    # Check if image has any non-zero pixels
+    if np.all(masked_img == 0):
+        print("Warning: Input image is all zeros")
+        return []
+    
+    data = pd.DataFrame(masked_img.reshape(-1, 3), columns=['R', 'G', 'B'], dtype=np.float32)
+    torch_kmeans = KMeans(n_clusters=n_classes, mode='euclidean', verbose=0)
+    input_data = data[['R', 'G', 'B']].values.astype(np.float32)
+    input = torch.tensor(input_data)
     data['Cluster'] = torch_kmeans.fit_predict(input).cpu().numpy()
-    palette = torch_kmeans.centroids.cpu().numpy() 
-
-    palette_list = list()
-    for color in palette:
-        palette_list.append([[tuple(color)]])
-    data['R_cluster'] = data['Cluster'].apply(lambda x: palette_list[x][0][0][0])
-    data['G_cluster'] = data['Cluster'].apply(lambda x: palette_list[x][0][0][1])
-    data['B_cluster'] = data['Cluster'].apply(lambda x: palette_list[x][0][0][2])
-    img_c = data[['R_cluster', 'G_cluster', 'B_cluster']].values
-    img_c = img_c.reshape(h,w, 3)
-    img_lst=[]
-    for i in range(1,n_classes):
-        j=img_c.copy()
-        j[j!=palette_list[i]]=0
-        img_lst.append(j)
-    #returns list of masked images
+    palette = torch_kmeans.centroids.cpu().numpy()
+    palette_list = [tuple(map(int, color)) for color in palette]
+    img_c = np.array([palette_list[x] for x in data['Cluster']]).reshape(h, w, 3)
+    img_lst = []
+    for i in range(1, n_classes):
+        mask = (img_c == palette_list[i]).all(axis=2)
+        j = np.zeros_like(img_c)
+        j[mask] = palette_list[i]
+        # Only add non-empty masks
+        if np.any(mask):
+            print(f"Added mask {i} with {np.sum(mask)} pixels")
+            img_lst.append(j)
+        else:
+            print(f"Skipping empty mask {i}")
+    
+    print(f"Returning {len(img_lst)} valid masks")
     return img_lst
 
-#Function for extracting traversable section from RGB image.
-def trav_cut(img,lpool):
-    lpool[lpool!=1]=255
-    lpool=cv2.resize(lpool,(img.shape[1],img.shape[0]))
-    dst= cv2.addWeighted(lpool,1,img,1,0)
+def trav_cut(img, lpool):
+    """Extract traversable section from RGB image using mask."""
+    lpool = np.where(lpool != 1, 255, lpool)
+    lpool = cv2.resize(lpool, (img.shape[1], img.shape[0]))
+    dst = cv2.addWeighted(lpool, 1, img, 1, 0)
     h, w, c = img.shape
-    #dst=cp.asarray(dst)
-# append Alpha channel -- required for BGRA (Blue, Green, Red, Alpha)
     image_bgra = np.concatenate([dst, np.full((h, w, 1), 255, dtype=np.uint8)], axis=-1)
-# create a mask where white pixels ([255, 255, 255]) are True
-    #dst=np.asarray(dst)
-    white = np.all(dst == [0,0,0], axis=-1)
-# change the values of Alpha to 0 for all the white pixels
+    white = np.all(dst == [0, 0, 0], axis=-1)
     image_bgra[white, -1] = 0
-    
-# save the image
     masked_img = cv2.cvtColor(image_bgra, cv2.COLOR_BGRA2BGR)
     return masked_img
 
-#Function for Mask Prediction.
-def mask_pred(img_lst,model):
-    mask_class=[]
-    for i in img_lst:
-        im=cv2.resize(i,(224,224))
-        #im=cv2.cvtColor(im.astype(np.float32),cv2.COLOR_BGR2RGB)
-        im=np.reshape(im,(1,224,224,3))
-        im=np.asarray(im)
-        nim=(im/ 127.0) - 1
-        prediction = model.predict(nim)
-#class in prediction:0=grass;1=puddle;2=dirt
-        # if np.argmax(prediction)==1:
-        #     mask_class.append(np.argmax(prediction)+5)
-        # else:
-        #     mask_class.append(np.argmax(prediction)+4)
-        mask_class.append(np.argmax(prediction)+4)
+def mask_pred(img_lst, model):
+    """Predict mask class for each image using the classification model, batched and parallelized."""
+    import gc
+    gc.collect()
+    mask_class = []
+    valid_imgs = []
+    for idx, i in enumerate(img_lst):
+        if i is None or i.size == 0 or np.all(i == 0):
+            continue
+        if i.dtype != np.uint8:
+            i = i.astype(np.uint8)
+        if len(i.shape) != 3 or i.shape[2] != 3:
+            continue
+        valid_imgs.append(i)
+    if not valid_imgs:
+        return mask_class
+    # Batch resize and preprocess
+    batch = np.stack([cv2.resize(i, (224, 224)) for i in valid_imgs]).astype(np.float32)
+    batch = (batch / 127.0) - 1
+    # Run prediction in parallel (if model supports it)
+    preds = model.predict(batch, verbose=0)
+    mask_class = list(np.argmax(preds, axis=1) + 4)
     return mask_class
-#function for combining the Mask.
-def mask_comb(newpool,img_lst,mask_class):
-    newpool=cv2.cvtColor(newpool.astype('float32'),cv2.COLOR_BGR2GRAY)
-    for i in range(len(mask_class)):
-        img=img_lst[i]
-        ima=cv2.resize(img,(newpool.shape[1],newpool.shape[0]))
-        #ima=cv2.erode(ima,cv2.getStructuringElement(cv2.MORPH_ELLIPSE,(3,3)))
-        #im=cv2.erode(im,kernel,iterations=1)
-        #im=cv2.GaussianBlur(im,(3,3),1)        
-        #im=cv2.dilate(im,kernel,iterations=1)
-        ima=cv2.cvtColor(ima.astype('float32'),cv2.COLOR_BGR2GRAY)
-        ima[ima>0]=mask_class[i]
-        bm=(mask_class[i]-ima)/mask_class[i]
-        fp=np.multiply(newpool,bm)
-        newpool=np.add(fp,ima)
-        newpool=np.asarray(newpool,dtype=np.uint8)
+
+def mask_comb(newpool, img_lst, mask_class):
+    """Combine mask predictions into a single mask."""
+    newpool = cv2.cvtColor(newpool.astype('float32'), cv2.COLOR_BGR2GRAY)
+    if not mask_class:
+        print("Warning: No valid mask predictions found, returning original pool")
+        return newpool.astype(np.uint8)
+    
+    for i, img in enumerate(img_lst):
+        if i >= len(mask_class):
+            break
+        ima = cv2.resize(img, (newpool.shape[1], newpool.shape[0]))
+        ima = cv2.cvtColor(ima.astype('float32'), cv2.COLOR_BGR2GRAY)
+        ima[ima > 0] = mask_class[i]
+        bm = (mask_class[i] - ima) / mask_class[i]
+        fp = np.multiply(newpool, bm)
+        newpool = np.add(fp, ima)
+        newpool = np.asarray(newpool, dtype=np.uint8)
     return newpool
 
-def col_seg(image,pool,model):
-    travcut=trav_cut(image,pool)
-    msk_img=palette_lst(travcut)
-    predicts=mask_pred(msk_img,model)
-    return msk_img,predicts
+def col_seg(image, pool, model):
+    """Run color segmentation and mask prediction pipeline."""
+    travcut = trav_cut(image, pool)
+    msk_img = palette_lst(travcut)
+    predicts = mask_pred(msk_img, model)
+    return msk_img, predicts
 
+def main():
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--model', dest='model', type=str, default='bisenetv2')
+    parser.add_argument('--weight-path', type=str, default='/Users/davidswan/Documents/personal-projects/costmap-gen/OFFSEG/offseg-pretrained-weights/Pre-trained_RUGD/model_final.pth')
+    parser.add_argument('--img-path', type=str, default='/Users/davidswan/Documents/personal-projects/costmap-gen/OFFSEG/data/Rellis_3D_image_example/pylon_camera_node/frame000002-1581624652_949.jpg')
+    parser.add_argument('--img-dir', type=str, default=None, help='Directory of images to process')
+    parser.add_argument('--output-path', type=str, default='/Users/davidswan/Documents/personal-projects/costmap-gen/OFFSEG/data/Rellis_3D_image_example/pylon_camera_node/frame000002-1581624652_949_output.jpg')
+    args = parser.parse_args()
 
-parse = argparse.ArgumentParser()
-parse.add_argument('--model', dest='model', type=str, default='bisenetv2',)
-parse.add_argument('--weight-path', type=str, default=dataset,)
-args = parse.parse_args()
-cfg = cfg_factory[args.model]
+    # Suppress warnings for clean benchmarking
+    warnings.filterwarnings('ignore')
+    os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
 
-#Load the classification Model
-model = tf.keras.models.load_model('../classification/model/keras_model.h5')
+    timings = {}
+    t0 = time.time()
+    cfg = cfg_factory[args.model]
+    timings['config'] = time.time() - t0
 
-#Loading Segmentation Model.
-net = model_factory[cfg.model_type](4)
-net.load_state_dict(torch.load(args.weight_path, map_location='cpu'))
-net.eval()
-net.cuda()
+    t1 = time.time()
+    model = tf.keras.models.load_model(
+        '/Users/davidswan/Documents/personal-projects/costmap-gen/OFFSEG/offseg-pretrained-weights/Classification_keras/keras_model.h5',
+        custom_objects={'DepthwiseConv2D': CompatibleDepthwiseConv2D}
+    )
+    timings['load_classification_model'] = time.time() - t1
 
-to_tensor = T.ToTensor(
-    mean=(0.3257, 0.3690, 0.3223), # city, rgb
-    std=(0.2112, 0.2148, 0.2115),
-)
-img_list=sorted(os.listdir(img_path))
-#label_list=sorted(os.listdir(save_path))
-for i in range(len(img_list)):
-    image=cv2.imread(os.path.join(img_path,img_list[i]))
-    #pool=cv2.imread(os.path.join(save_path,label_list[i]))
-    im=image.copy()[:, :, ::-1]
-    #image=cv2.resize(image,(1024,640))
-    pred,pool =img_seg(im,net)
-    cv2.imwrite(os.path.join(final_path,img_list[i][:len(img_list[i])]),pred)
-    pool1=pool.copy()
-    msk_img,predicts= col_seg(image,pool,model)
-    final_pool=mask_comb(pool1,msk_img,predicts)
-    cv2.imwrite(os.path.join(final_path,img_list[i]),pal[final_pool])
+    t2 = time.time()
+    net = model_factory[cfg.model_type](4)
+    net.load_state_dict(torch.load(args.weight_path, map_location='cpu'))
+    net.eval()
+    if torch.cuda.is_available():
+        device = torch.device('cuda')
+    elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
+        device = torch.device('mps')
+    else:
+        device = torch.device('cpu')
+    net.to(device)
+    timings['load_segmentation_model'] = time.time() - t2
+
+    t3 = time.time()
+    to_tensor = T.ToTensor(
+        mean=(0.3257, 0.3690, 0.3223),
+        std=(0.2112, 0.2148, 0.2115),
+    )
+    timings['init_misc'] = time.time() - t3
+
+    # Directory mode
+    if args.img_dir:
+        img_files = sorted(glob.glob(os.path.join(args.img_dir, '*.jpg')) + glob.glob(os.path.join(args.img_dir, '*.png')))
+        if not img_files:
+            print(f"No images found in directory: {args.img_dir}")
+            return
+        output_dir = args.output_path if os.path.isdir(args.output_path) else os.path.dirname(args.output_path)
+        if not os.path.exists(output_dir):
+            os.makedirs(output_dir)
+        total_times = []
+        for img_path in img_files:
+            per_img_t0 = time.time()
+            image = cv2.imread(img_path)
+            if image is None:
+                print(f"Error: Could not load image from {img_path}")
+                continue
+            max_dim = 640
+            if max(image.shape[:2]) > max_dim:
+                scale = max_dim / max(image.shape[:2])
+                image = cv2.resize(image, (int(image.shape[1]*scale), int(image.shape[0]*scale)))
+            im = image.copy()[:, :, ::-1]
+            pred, pool = img_seg(im, net, to_tensor, pal)
+            base = os.path.splitext(os.path.basename(img_path))[0]
+            out_pred_path = os.path.join(output_dir, f"{base}_seg_pred.jpg")
+            cv2.imwrite(out_pred_path, pred)
+            pool1 = pool.copy()
+            msk_img, predicts = col_seg(image, pool, model)
+            final_pool = mask_comb(pool1, msk_img, predicts)
+            out_final_path = os.path.join(output_dir, f"{base}_output.jpg")
+            cv2.imwrite(out_final_path, pal[final_pool])
+            per_img_time = time.time() - per_img_t0
+            total_times.append(per_img_time)
+            print(f"Processed {img_path} in {per_img_time:.3f}s. Output: {out_final_path}")
+        print(f"\nProcessed {len(img_files)} images in {sum(total_times):.2f}s. Avg: {np.mean(total_times):.3f}s/image")
+        return
+
+    # Single image mode (default)
+    image = cv2.imread(args.img_path)
+    if image is None:
+        print(f"Error: Could not load image from {args.img_path}")
+        exit(1)
+    max_dim = 640
+    if max(image.shape[:2]) > max_dim:
+        scale = max_dim / max(image.shape[:2])
+        image = cv2.resize(image, (int(image.shape[1]*scale), int(image.shape[0]*scale)))
+    im = image.copy()[:, :, ::-1]
+    pred, pool = img_seg(im, net, to_tensor, pal)
+    output_dir = os.path.dirname(args.output_path)
+    if not os.path.exists(output_dir):
+        os.makedirs(output_dir)
+    cv2.imwrite(args.output_path, pred)
+    pool1 = pool.copy()
+    msk_img, predicts = col_seg(image, pool, model)
+    final_pool = mask_comb(pool1, msk_img, predicts)
+    output_filename = os.path.basename(args.img_path).replace('.jpg', '_output.jpg')
+    output_path = os.path.join(output_dir, output_filename)
+    cv2.imwrite(output_path, pal[final_pool])
+    print(f"\nProcessing complete. Output saved to: {output_path}")
+    # Print timings for single image
+    total_time = time.time() - t0
+    print("\n--- Pipeline Timing (seconds) ---")
+    for k, v in timings.items():
+        print(f"{k:40s}: {v:.4f}")
+    print(f"{'total':40s}: {total_time:.4f}")
+
+if __name__ == '__main__':
+    main()
